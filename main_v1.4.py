@@ -22,9 +22,8 @@ Model files (download separately):
   GFPGANv1.4.pth      → Optional face enhancement
 """
 
-import os
 import sys
-
+import os
 # ══════════════════════════════════════════════════════════════════
 #  STEP 1 — env vars BEFORE any native lib loads
 # ══════════════════════════════════════════════════════════════════
@@ -156,25 +155,25 @@ from PyQt5.QtGui import (
     QPixmap, QImage, QFont, QColor, QTextCursor,
     QDragEnterEvent, QDropEvent
 )
-import torch
-torch.zeros(1)
-torch.cuda._lazy_init   = lambda: None   # ← ADD
-torch.cuda._initialized = True           # ← ADD
+env = os.environ.copy()
+env["PYTHONIOENCODING"] = "utf-8"
+env["PYTHONUTF8"]       = "1"
 
-def _diagnose_dll(torch_lib: Path):
+def _safe_enhancer(enhancer: str) -> str:
     """
-    Prints which DLLs exist vs are missing in torch/lib to help
-    diagnose the exact missing dependency.
+    Returns 'none' if gfpgan is not properly installed.
+    Prevents 'NoneType is not callable' crash in SadTalker.
     """
-    import ctypes
-    print("\n[diagnose] Checking all DLLs in torch/lib:")
-    for dll in sorted(torch_lib.glob("*.dll")):
-        try:
-            ctypes.WinDLL(str(dll))
-            print(f"  ✔ {dll.name}")
-        except OSError as e:
-            print(f"  ✖ {dll.name}  →  {e}")
-
+    if enhancer in ("none", ""):
+        return "none"
+    try:
+        from gfpgan import GFPGANer
+        if GFPGANer is None:
+            raise ImportError
+        return enhancer
+    except Exception:
+        print(f"[sadtalker] {enhancer} not available — falling back to 'none'")
+        return "none"
 
 # ═══════════════════════════════════════════════════════════════════
 #  CONSTANTS & STYLESHEET
@@ -377,11 +376,17 @@ QDialog {{
 }}
 """
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  BACKEND PIPELINE CLASSES
+# ═══════════════════════════════════════════════════════════════════
+
 def _cpu_args(args: tuple) -> tuple:
     """
-    Redirect any CUDA device argument to CPU.
+    Redirect any cuda device argument to CPU.
     Handles: str 'cuda', str 'cuda:0',
              torch.device('cuda'), torch.device('cuda:0')
+    Must be module-level so _force_cpu() closures can reference it.
     """
     if not args:
         return args
@@ -396,87 +401,73 @@ def _cpu_args(args: tuple) -> tuple:
         pass
     return args
 
-class InsightFaceBackend:
-    ...
-
-# ═══════════════════════════════════════════════════════════════════
-#  BACKEND PIPELINE CLASSES
-# ═══════════════════════════════════════════════════════════════════
 
 class InsightFaceBackend:
+    """
+    roop-style one-click face swap via InsightFace + inswapper_128.onnx.
+
+    Setup:
+        pip install insightface onnxruntime          # CPU
+        pip install insightface onnxruntime-gpu      # GPU
+        Download: inswapper_128.onnx from huggingface/ezioruan/inswapper_128
+    """
     def __init__(self):
         self.face_app = None
         self.swapper  = None
         self.loaded   = False
 
     def load(self, model_path: str, use_gpu: bool = False):
-        # ── Resolve model path ────────────────────────────────────
-        resolved = Path(model_path)
-        candidates = [
-            Path(model_path),
-            Path(__file__).parent / model_path,
-            Path.cwd() / model_path,
-            Path.home() / ".insightface" / "models" / model_path,
-        ]
-        for c in candidates:
-            if c.exists():
-                resolved = c
-                break
-
-        if not resolved.exists():
-            raise RuntimeError(
-                f"Swapper model not found.\n\n"
-                f"Searched:\n"
-                f"  • {Path(__file__).parent / model_path}\n"
-                f"  • {Path.cwd() / model_path}\n\n"
-                f"Click  …  in the InsightFace tab to browse to inswapper_128.onnx\n"
-                f"Download: https://huggingface.co/ezioruan/inswapper_128.onnx"
-            )
-        model_path = str(resolved)
-
-        # Stage 1 — import check
+        # ── Step 1: verify imports only ───────────────────────────
         try:
             import insightface
             from insightface.app import FaceAnalysis
         except ImportError as exc:
+            # Surface the real missing dependency, not a generic message
             raise RuntimeError(
-                "insightface not installed.\n"
-                'Run: pip install insightface "onnxruntime==1.19.2" "numpy<2"'
+                f"InsightFace import failed — a dependency is missing or broken.\n\n"
+                f"Root cause:\n  {type(exc).__name__}: {exc}\n\n"
+                f"Fix options:\n"
+                f"  1) pip install insightface onnxruntime albumentations onnx scikit-learn\n"
+                f"  2) Make sure the app is launched from the SAME venv where insightface is installed:\n"
+                f"     .venv\\Scripts\\activate  →  python deepfake_studio.py\n"
+                f"  3) Verify with: python -c \"from insightface.app import FaceAnalysis\""
             ) from exc
 
-        # Stage 2 — load models (insightface 1.0.x API)
+        # ── Step 2: load models (real errors now surface clearly) ─
         try:
             providers = (
                 ["CUDAExecutionProvider", "CPUExecutionProvider"]
                 if use_gpu else ["CPUExecutionProvider"]
             )
-            self.face_app = FaceAnalysis(
-                name="buffalo_l",
-                providers=providers,
-                allowed_modules=["detection", "recognition"]
+            self.face_app = FaceAnalysis(name="buffalo_l", providers=providers)
+            self.face_app.prepare(
+                ctx_id=0 if use_gpu else -1,
+                det_size=(640, 640)
             )
-            self.face_app.prepare(ctx_id=0 if use_gpu else -1, det_size=(640, 640))
-
-            # insightface 1.0.x: get_model() returns INSwapper directly
-            # NO .prepare() call — it was removed in 1.0.x
+            # insightface 1.0.x: get_model accepts a full file path directly
+            if not os.path.isfile(model_path):
+                raise FileNotFoundError(
+                    f"inswapper model not found: '{model_path}'\n"
+                    f"Download from: https://huggingface.co/ezioruan/inswapper_128.onnx\n"
+                    f"Then set the path in the InsightFace Swap tab."
+                )
             self.swapper = insightface.model_zoo.get_model(
-                model_path, providers=providers
+                model_path, download=False, download_zip=False
             )
+            self.swapper.prepare(ctx_id=0 if use_gpu else -1)
             self.loaded = True
-
         except Exception as exc:
-            err = str(exc)
-            if "onnxruntime" in err.lower() or "Unable to import" in err:
-                raise RuntimeError(
-                    "NumPy/ORT version conflict.\n\n"
-                    "Fix:\n"
-                    "  pip uninstall onnxruntime numpy -y\n"
-                    '  pip install "numpy<2" "onnxruntime==1.19.2"'
-                ) from exc
-            else:
-                raise RuntimeError(f"InsightFace model load failed:\n\n{exc}") from exc
+            raise RuntimeError(
+                f"InsightFace model load failed:\n\n{exc}\n\n"
+                f"Checklist:\n"
+                f"  • inswapper_128.onnx path is correct (use the … button)\n"
+                f"  • buffalo_l downloads automatically to ~/.insightface/models/\n"
+                f"  • If GPU checked but no CUDA: uncheck 'Use GPU'\n"
+                f"  • onnxruntime version: {__import__('onnxruntime').__version__}"
+            ) from exc
 
     def get_source_face(self, source_img: np.ndarray):
+        """Return the largest detected face from the source image."""
         if not self.loaded:
             raise RuntimeError("InsightFace model not loaded.")
         faces = self.face_app.get(source_img)
@@ -491,6 +482,10 @@ class InsightFaceBackend:
         face_index: int = -1,
         enhance: bool = True,
     ) -> np.ndarray:
+        """
+        Swap face(s) in `frame` with `source_face`.
+        face_index -1  →  swap all detected faces.
+        """
         if not self.loaded:
             raise RuntimeError("InsightFace model not loaded.")
         target_faces = self.face_app.get(frame)
@@ -509,6 +504,7 @@ class InsightFaceBackend:
 
     @staticmethod
     def _try_enhance(img: np.ndarray) -> np.ndarray:
+        """Attempt GFPGAN face restoration; silently skip if unavailable."""
         try:
             from gfpgan import GFPGANer
             enhancer = GFPGANer(model_path="GFPGANv1.4.pth", upscale=1)
@@ -519,8 +515,16 @@ class InsightFaceBackend:
 
 
 class SimSwapBackend:
+    """
+    Identity-preserving face swap via SimSwap subprocess calls.
+
+    Setup:
+        git clone https://github.com/neuralchen/SimSwap
+        cd SimSwap && pip install -r requirements.txt
+        Download pretrained models per SimSwap README.
+    """
     def __init__(self, simswap_dir: str = ""):
-        self.dir = str(Path(simswap_dir).resolve()) if simswap_dir else ""
+        self.dir = simswap_dir
 
     def _validate(self):
         if not self.dir or not os.path.isdir(self.dir):
@@ -528,270 +532,80 @@ class SimSwapBackend:
                 f"SimSwap directory not found: '{self.dir}'\n"
                 "Set the correct path in the SimSwap tab."
             )
-        ckpt = Path(self.dir) / "checkpoints" / "people" / "latest_net_G.pth"
-        if not ckpt.exists():
-            raise RuntimeError(
-                f"SimSwap pretrained model not found:\n{ckpt}\n\n"
-                f"Download from:\n"
-                f"  https://drive.google.com/file/d/1PN4EOo27CUpGimWFvhDgkVgb-aeMlgZI/view"
-            )
-        arcface = Path(self.dir) / "arcface_model" / "arcface_checkpoint.tar"
-        if not arcface.exists():
-            raise RuntimeError(
-                f"SimSwap arcface model not found:\n{arcface}\n\n"
-                f"Download from:\n"
-                f"  https://drive.google.com/file/d/1aGCB8qHuSjBGNcm6KAhHOvHFKT8ZVJF/view"
-            )
-        antelope = Path(self.dir) / "insightface_func" / "models" / "antelope"
-        for fname in ["scrfd_10g_bnkps.onnx", "glintr100.onnx"]:
-            if not (antelope / fname).exists():
-                raise RuntimeError(
-                    f"SimSwap antelope model missing:\n{antelope / fname}\n\n"
-                    f"Download from:\n"
-                    f"  https://github.com/neuralchen/SimSwap/issues/255"
-                )
 
-    def _setup_path(self):
-        if self.dir not in sys.path:
-            sys.path.insert(0, self.dir)
-        os.chdir(self.dir)
-
-    def _flush_simswap_modules(self):
-        prefixes = (
-            "models", "options", "util", "data",
-            "test_one_image", "test_video_swapsingle",
-            "fs_model", "base_model", "networks",
-            "parsing_model", "swap_pipeline", "insightface_func",
+    @staticmethod
+    def _run(cmd, cwd):
+        """Run subprocess and raise with full stderr on failure."""
+        result = subprocess.run(
+            cmd, cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
         )
-        to_remove = [
-            k for k in list(sys.modules.keys())
-            if any(k == p or k.startswith(p + ".") for p in prefixes)
-        ]
-        for k in to_remove:
-            del sys.modules[k]
-
-    def _patch_scrfd(self):
-        """
-        Patch SimSwap's SCRFD.detect() to work with any insightface version.
-        Scans the actual detect() signature and maps threshold kwargs correctly.
-        """
-        import importlib.util, inspect
-        scrfd_candidates = [
-            os.path.join(self.dir, "insightface_func", "face_detect_crop_single.py"),
-            os.path.join(self.dir, "insightface_func", "face_detect_crop_multi.py"),
-        ]
-        # Find SCRFD class in insightface installed package
-        try:
-            from insightface.model_zoo.scrfd import SCRFD
-            _orig = SCRFD.detect
-            sig_params = list(inspect.signature(_orig).parameters.keys())
-            print(f"[scrfd_patch] detect() params: {sig_params}")
-
-            def _patched(self_s, img, max_num=0, **kwargs):
-                # Remove all threshold variants from kwargs
-                thresh = (
-                    kwargs.pop("det_thresh", None) or
-                    kwargs.pop("threshold",  None) or
-                    0.5
-                )
-                # Re-inject as whatever the real param name is
-                for p in sig_params:
-                    if "thresh" in p.lower() and p not in ("max_num",):
-                        kwargs[p] = thresh
-                        break
-                return _orig(self_s, img, max_num=max_num, **kwargs)
-
-            SCRFD.detect = _patched
-            print("[scrfd_patch] SCRFD.detect patched ✔")
-        except Exception as e:
-            print(f"[scrfd_patch] skipped: {e}")
-
-    def _force_cpu(self):
-        import functools
-        import collections
-        import collections.abc
-
-        # Python 3.10+ collections fix
-        for _name in [
-            "Callable", "Mapping", "MutableMapping", "Sequence",
-            "MutableSequence", "Iterable", "Iterator", "MutableSet",
-        ]:
-            if not hasattr(collections, _name):
-                setattr(collections, _name, getattr(collections.abc, _name))
-        # ── NumPy deprecated alias patch (removed in NumPy 1.24+) ─────────
-        # SimSwap uses np.float, np.int, np.bool, np.complex, np.object, np.str
-        try:
-            import numpy as np
-            _numpy_aliases = {
-                "float": np.float64,
-                "int": np.int_,
-                "bool": np.bool_,
-                "complex": np.complex128,
-                "object": np.object_,
-                "str": np.str_,
-                "long": np.int_,
-                "unicode": np.str_,
-            }
-            for _alias, _target in _numpy_aliases.items():
-                if not hasattr(np, _alias):
-                    setattr(np, _alias, _target)
-            print("[force_cpu] numpy aliases restored ✔")
-        except Exception as e:
-            print(f"[force_cpu] numpy alias patch warning: {e}")
-
-        try:
-            import torch
-
-            torch.cuda._lazy_init            = lambda: None
-            torch.cuda._initialized          = True
-            torch.cuda.is_available          = lambda: False
-            torch.cuda.set_device            = lambda *a, **kw: None
-            torch.cuda.current_device        = lambda: -1
-            torch.cuda.device_count          = lambda: 0
-            torch.cuda.get_device_properties = lambda *a, **kw: None
-            torch.cuda.synchronize           = lambda *a, **kw: None
-            torch.cuda.empty_cache           = lambda *a, **kw: None
-            torch.Tensor.cuda                = lambda self, *a, **kw: self
-            torch.nn.Module.cuda             = lambda self, *a, **kw: self
-
-            _orig_load = torch.load
-
-            @functools.wraps(_orig_load)
-            def _cpu_load(f, map_location=None, weights_only=False, **kwargs):
-                return _orig_load(
-                    f,
-                    map_location=torch.device("cpu"),
-                    weights_only=False,
-                    **kwargs
-                )
-
-            torch.load = _cpu_load
-
-            _orig_tensor_to = torch.Tensor.to
-
-            @functools.wraps(_orig_tensor_to)
-            def _safe_tensor_to(self, *a, **kw):
-                return _orig_tensor_to(self, *_cpu_args(a), **kw)
-
-            torch.Tensor.to = _safe_tensor_to
-
-            _orig_module_to = torch.nn.Module.to
-
-            @functools.wraps(_orig_module_to)
-            def _safe_module_to(self, *a, **kw):
-                return _orig_module_to(self, *_cpu_args(a), **kw)
-
-            torch.nn.Module.to = _safe_module_to
-
-        except Exception as e:
-            print(f"[force_cpu] patch warning: {e}")
-
-    def _exec(self, script_name: str):
-        import importlib.util
-        import traceback
-
-        spec   = importlib.util.spec_from_file_location(
-            "__main__", os.path.join(self.dir, script_name)
-        )
-        module = importlib.util.module_from_spec(spec)
-
-        try:
-            spec.loader.exec_module(module)
-
-        except SystemExit as e:
-            if e.code not in (None, 0):
-                raise RuntimeError(
-                    f"SimSwap exited with code {e.code}\n"
-                    f"Check model files in:\n"
-                    f"  {self.dir}\\checkpoints\\people\\\n"
-                    f"  {self.dir}\\arcface_model\\"
-                )
-
-        except TypeError as e:
-            if "exceptions must derive from BaseException" in str(e):
-                pass  # Python 2 legacy raise — safe to ignore
-            else:
-                raise RuntimeError(
-                    f"SimSwap TypeError: {e}\n\n{traceback.format_exc()}"
-                )
-
-        except AssertionError as e:
+        if result.returncode != 0:
             raise RuntimeError(
-                f"SimSwap assertion failed: {str(e) or '(no message)'}\n\n"
-                f"--- Traceback ---\n{traceback.format_exc()}"
+                f"Subprocess exited with code {result.returncode}.\n\n"
+                f"--- Output ---\n{result.stdout[-3000:]}"
             )
+        return result
 
-        except Exception as e:
-            raise RuntimeError(
-                f"SimSwap error: {str(e) or type(e).__name__}\n\n"
-                f"--- Traceback ---\n{traceback.format_exc()}"
-            )
-
-    def swap_image(self, source_path, target_path, output_path,
-                   crop_size=224, use_mask=True) -> str:
+    def swap_image(
+        self,
+        source_path: str,
+        target_path: str,
+        output_path: str,
+        crop_size: int = 224,
+        use_mask: bool = True,
+    ) -> str:
         self._validate()
-        source_path = str(Path(source_path).resolve())
-        target_path = str(Path(target_path).resolve())
-        output_path = str(Path(output_path).resolve())
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-        self._force_cpu()
-        self._patch_scrfd()
-        self._flush_simswap_modules()
-        self._setup_path()
-
-        sys.argv = [
-            "test_one_image.py",
-            "--pic_a_path",  source_path,
-            "--pic_b_path",  target_path,
+        cmd = [
+            sys.executable, "test_one_image.py",
+            "--pic_a_path", source_path,
+            "--pic_b_path", target_path,
             "--output_path", output_path,
-            "--crop_size",   str(crop_size),
-            "--gpu_ids",     "-1",
+            "--crop_size", str(crop_size),
         ]
         if use_mask:
-            sys.argv.append("--use_mask")
-
-        self._exec("test_one_image.py")
+            cmd.append("--use_mask")
+        self._run(cmd, self.dir)
         return output_path
 
-    def swap_video(self, source_path, target_video, output_path,
-                   crop_size=224, use_mask=True) -> str:
+    def swap_video(
+        self,
+        source_path: str,
+        target_video: str,
+        output_path: str,
+        crop_size: int = 224,
+        use_mask: bool = True,
+    ) -> str:
         self._validate()
-        source_path  = str(Path(source_path).resolve())
-        target_video = str(Path(target_video).resolve())
-        output_path  = str(Path(output_path).resolve())
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-        tmp = str(Path(self.dir) / "tmp_deepfake_studio")
+        tmp = os.path.join(self.dir, "tmp_deepfake_studio")
         os.makedirs(tmp, exist_ok=True)
-
-        self._force_cpu()
-        self._patch_scrfd()
-        self._flush_simswap_modules()
-        self._setup_path()
-
-        sys.argv = [
-            "test_video_swapsingle.py",
-            "--pic_a_path",  source_path,
-            "--video_path",  target_video,
+        cmd = [
+            sys.executable, "test_video_swapsingle.py",
+            "--pic_a_path", source_path,
+            "--video_path", target_video,
             "--output_path", output_path,
-            "--crop_size",   str(crop_size),
-            "--temp_path",   tmp,
-            "--gpu_ids",     "-1",
+            "--crop_size", str(crop_size),
+            "--temp_path", tmp,
         ]
         if use_mask:
-            sys.argv.append("--use_mask")
-
-        self._exec("test_video_swapsingle.py")
+            cmd.append("--use_mask")
+        self._run(cmd, self.dir)
         return output_path
+
 
 class SadTalkerBackend:
     """
-    Runs SadTalker IN-PROCESS via importlib — avoids Windows DLL issues.
-    Audio-driven talking head: source image + audio → video.
+    Audio-driven talking head generation via SadTalker.
+
+    Setup:
+        git clone https://github.com/OpenTalker/SadTalker
+        cd SadTalker && pip install -r requirements.txt
+        bash scripts/download_models.sh
     """
     def __init__(self, sadtalker_dir: str = ""):
-        self.dir = str(Path(sadtalker_dir).resolve()) if sadtalker_dir else ""
+        self.dir = sadtalker_dir
 
     def _validate(self):
         if not self.dir or not os.path.isdir(self.dir):
@@ -800,239 +614,65 @@ class SadTalkerBackend:
                 "Set the correct path in the SadTalker tab."
             )
 
-        # Check specific checkpoint files
-        required = {
-            Path(self.dir) / "checkpoints" / "SadTalker_V0.0.2_256.safetensors":
-                "1uweTnhMsV5LRJJK46aaEFWHFWfkm4nY",
-            Path(self.dir) / "checkpoints" / "mapping_00109-model.pth.tar":
-                "1hSSWJFpRPMGZXvPRfFJHBp2Y5nHWOHSV",
-            Path(self.dir) / "checkpoints" / "mapping_00229-model.pth.tar":
-                "1mlswlDX2bKHUGdyo5lBnQjA5YMnFbVsm",
-            Path(self.dir) / "gfpgan" / "weights" / "GFPGANv1.4.pth":
-                "1TbIHSHB50vDeRkX3RNs48GcKT1WwjHj3",
-        }
-
-        missing = [
-            (str(p), fid)
-            for p, fid in required.items()
-            if not p.exists()
-        ]
-
-        if missing:
-            lines = "\n".join(
-                f"  • {Path(p).name}\n"
-                f"    → https://drive.google.com/uc?id={fid}"
-                for p, fid in missing
-            )
-            raise RuntimeError(
-                f"SadTalker missing model files:\n\n{lines}\n\n"
-                f"Run the download script or get them from:\n"
-                f"  https://drive.google.com/drive/folders/1Wd88VDoLhVzYsQ30_qDVluQr_Xm46yHT"
-            )
-
-    def _setup_path(self):
-        if self.dir not in sys.path:
-            sys.path.insert(0, self.dir)
-        os.chdir(self.dir)
-
-    def _flush_modules(self):
-        prefixes = (
-            "src", "modules", "facerender", "generate_batch",
-            "generate_facerender_batch", "inference",
-            "audio2pose", "audio2exp", "animate",
+    @staticmethod
+    def _run(cmd, cwd):
+        result = subprocess.run(
+            cmd, cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env
         )
-        to_remove = [
-            k for k in list(sys.modules.keys())
-            if any(k == p or k.startswith(p + ".") for p in prefixes)
-        ]
-        for k in to_remove:
-            del sys.modules[k]
-
-    def _force_cpu(self):
-        import functools
-        import collections
-        import collections.abc
-
-        # Python 3.10+ fix
-        for _name in [
-            "Callable", "Mapping", "MutableMapping", "Sequence",
-            "MutableSequence", "Iterable", "Iterator", "MutableSet",
-        ]:
-            if not hasattr(collections, _name):
-                setattr(collections, _name, getattr(collections.abc, _name))
-
-        # NumPy alias fix
-        try:
-
-            import numpy as np
-            for _alias, _target in {
-                "float":   np.float64,
-                "int":     np.int_,
-                "bool":    np.bool_,
-                "complex": np.complex128,
-                "object":  np.object_,
-                "str":     np.str_,
-                "VisibleDeprecationWarning": np.exceptions.VisibleDeprecationWarning,
-                "RankWarning": np.exceptions.RankWarning,
-            }.items():
-                if not hasattr(np, _alias):
-                    setattr(np, _alias, _target)
-        except Exception:
-            pass
-        # ── torchvision.transforms.functional_tensor compatibility ────────
-        # Removed in torchvision 0.16+ — basicsr/gfpgan still imports from it
-        try:
-            import torchvision.transforms.functional as _F
-            import torchvision.transforms
-            import types
-
-            _ft = types.ModuleType("torchvision.transforms.functional_tensor")
-
-            # Map all commonly used functions to their new locations
-            _ft.rgb_to_grayscale = _F.rgb_to_grayscale
-            _ft.adjust_brightness = _F.adjust_brightness
-            _ft.adjust_contrast = _F.adjust_contrast
-            _ft.adjust_saturation = _F.adjust_saturation
-            _ft.adjust_hue = _F.adjust_hue
-            _ft.adjust_gamma = _F.adjust_gamma
-            _ft.adjust_sharpness = _F.adjust_sharpness
-            _ft.normalize = _F.normalize
-            _ft.resize = _F.resize
-            _ft.pad = _F.pad
-            _ft.crop = _F.crop
-            _ft.center_crop = _F.center_crop
-            _ft.hflip = _F.hflip
-            _ft.vflip = _F.vflip
-            _ft.rotate = _F.rotate
-            _ft.perspective = _F.perspective
-            _ft.gaussian_blur = _F.gaussian_blur
-            _ft.to_grayscale = _F.rgb_to_grayscale
-
-            # Register as a real module so any import finds it
-            import sys as _sys
-            _sys.modules["torchvision.transforms.functional_tensor"] = _ft
-            torchvision.transforms.functional_tensor = _ft
-            print("[force_cpu] torchvision.transforms.functional_tensor patched ✔")
-        except Exception as e:
-            print(f"[force_cpu] torchvision patch warning: {e}")
-
-        try:
-            import torch
-            torch.cuda._lazy_init            = lambda: None
-            torch.cuda._initialized          = True
-            torch.cuda.is_available          = lambda: False
-            torch.cuda.set_device            = lambda *a, **kw: None
-            torch.cuda.current_device        = lambda: -1
-            torch.cuda.device_count          = lambda: 0
-            torch.cuda.get_device_properties = lambda *a, **kw: None
-            torch.cuda.synchronize           = lambda *a, **kw: None
-            torch.cuda.empty_cache           = lambda *a, **kw: None
-            torch.Tensor.cuda                = lambda self, *a, **kw: self
-            torch.nn.Module.cuda             = lambda self, *a, **kw: self
-
-            _orig_load = torch.load
-            @functools.wraps(_orig_load)
-            def _cpu_load(f, map_location=None, weights_only=False, **kwargs):
-                return _orig_load(
-                    f, map_location=torch.device("cpu"),
-                    weights_only=False, **kwargs
-                )
-            torch.load = _cpu_load
-
-            _orig_tensor_to = torch.Tensor.to
-            @functools.wraps(_orig_tensor_to)
-            def _safe_tensor_to(self, *a, **kw):
-                return _orig_tensor_to(self, *_cpu_args(a), **kw)
-            torch.Tensor.to = _safe_tensor_to
-
-            _orig_module_to = torch.nn.Module.to
-            @functools.wraps(_orig_module_to)
-            def _safe_module_to(self, *a, **kw):
-                return _orig_module_to(self, *_cpu_args(a), **kw)
-            torch.nn.Module.to = _safe_module_to
-
-        except Exception as e:
-            print(f"[sadtalker force_cpu] warning: {e}")
-
-    def _exec(self, script_name: str):
-        import importlib.util
-        import traceback
-
-        spec   = importlib.util.spec_from_file_location(
-            "__main__", os.path.join(self.dir, script_name)
-        )
-        module = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(module)
-        except SystemExit as e:
-            if e.code not in (None, 0):
-                raise RuntimeError(f"SadTalker exited with code {e.code}")
-        except TypeError as e:
-            if "exceptions must derive from BaseException" in str(e):
-                pass
-            else:
-                raise RuntimeError(
-                    f"SadTalker TypeError: {e}\n\n{traceback.format_exc()}"
-                )
-        except Exception as e:
+        if result.returncode != 0:
             raise RuntimeError(
-                f"SadTalker error: {str(e) or type(e).__name__}\n\n"
-                f"{traceback.format_exc()}"
+                f"Subprocess exited with code {result.returncode}.\n\n"
+                f"--- Output ---\n{result.stdout[-3000:]}"
             )
+        return result
 
     def generate(
         self,
         source_image: str,
         driven_audio: str,
-        output_dir:   str,
-        size:         int  = 256,
-        preprocess:   str  = "crop",
-        still:        bool = False,
-        enhancer:     str  = "gfpgan",
+        output_dir: str,
+        size: int = 256,
+        preprocess: str = "crop",
+        still: bool = False,
+        enhancer: str = "gfpgan",
     ) -> str:
         self._validate()
-
-        # Resolve all paths to absolute BEFORE chdir
-        source_image = str(Path(source_image).resolve())
-        driven_audio = str(Path(driven_audio).resolve())
-        output_dir   = str(Path(output_dir).resolve())
         os.makedirs(output_dir, exist_ok=True)
-
-        self._force_cpu()
-        self._flush_modules()
-        self._setup_path()   # chdir AFTER path resolution
-
-        sys.argv = [
-            "inference.py",
-            "--driven_audio", driven_audio,
-            "--source_image", source_image,
-            "--result_dir",   output_dir,
-            "--size",         str(size),
-            "--preprocess",   preprocess,
-            "--enhancer",     enhancer,
-            "--cpu",                        # force CPU mode natively
+        cmd = [
+            sys.executable, "inference.py",
+            "--driven_audio",  driven_audio,
+            "--source_image",  source_image,
+            "--result_dir",    output_dir,
+            "--size",          str(size),
+            "--preprocess",    preprocess,
+            "--enhancer",      enhancer,
         ]
         if still:
-            sys.argv.append("--still")
-
-        self._exec("inference.py")
-
-        # Find newest output video
+            cmd.append("--still")
+        self._run(cmd, self.dir)
         outputs = sorted(
-            list(Path(output_dir).rglob("*.mp4")),
+            Path(output_dir).glob("*.mp4"),
             key=lambda p: p.stat().st_mtime
         )
         if not outputs:
-            raise RuntimeError(
-                f"SadTalker produced no output video.\n"
-                f"Searched: {output_dir}"
-            )
+            raise RuntimeError("SadTalker produced no output video.")
         return str(outputs[-1])
+
 
 class FOMMBackend:
     """
-    Runs FOMM IN-PROCESS via importlib — avoids Windows DLL
-    subprocess isolation issues with torch/c10.dll.
+    Video-driven face reenactment via First Order Motion Model.
+
+    Setup:
+        git clone https://github.com/AliaksandrSiarohin/first-order-model
+        cd first-order-model && pip install -r requirements.txt
+        Download vox-cpk.pth.tar from the FOMM releases.
     """
     def __init__(self, fomm_dir: str = ""):
         self.dir = fomm_dir
@@ -1044,118 +684,52 @@ class FOMMBackend:
                 "Set the correct path in the FOMM tab."
             )
 
-    def _setup_path(self):
-        if self.dir not in sys.path:
-            sys.path.insert(0, self.dir)
-        os.chdir(self.dir)
-
-    def _force_cpu(self):
-        import functools
-        import collections, collections.abc
-
-        # ── Python 3.10+ collections fix ──────────────────────────────
-        for _name in ["Callable", "Mapping", "MutableMapping", "Sequence",
-                      "MutableSequence", "Iterable", "Iterator", "MutableSet"]:
-            if not hasattr(collections, _name):
-                setattr(collections, _name, getattr(collections.abc, _name))
-
-        try:
-            import torch
-
-            # ── Patch _lazy_init — root cause of "not compiled with CUDA"
-            # This is called internally by ANY cuda operation and raises
-            # AssertionError if CUDA is unavailable — patch it to no-op
-            torch.cuda._lazy_init = lambda: None
-            torch.cuda._initialized = True
-
-            # ── CUDA availability ──────────────────────────────────────
-            torch.cuda.is_available = lambda: False
-            torch.cuda.set_device = lambda *a, **kw: None
-            torch.cuda.current_device = lambda: -1
-            torch.cuda.device_count = lambda: 0
-            torch.cuda.get_device_properties = lambda *a, **kw: None
-            torch.cuda.synchronize = lambda *a, **kw: None
-            torch.cuda.empty_cache = lambda *a, **kw: None
-
-            # ── .cuda() calls → no-op ──────────────────────────────────
-            torch.Tensor.cuda = lambda self, *a, **kw: self
-            torch.nn.Module.cuda = lambda self, *a, **kw: self
-
-            # ── torch.load → always CPU ────────────────────────────────
-            _orig_load = torch.load
-
-            @functools.wraps(_orig_load)
-            def _cpu_load(f, map_location=None, weights_only=False, **kwargs):
-                return _orig_load(
-                    f,
-                    map_location=torch.device("cpu"),
-                    weights_only=False,  # ← required for SimSwap/FOMM legacy checkpoints
-                    **kwargs
-                )
-
-            torch.load = _cpu_load
-
-            # ── .to() — handle BOTH string AND torch.device objects ───
-            # Previous version only caught strings — missed torch.device('cuda:0')
-            _orig_tensor_to = torch.Tensor.to
-
-            @functools.wraps(_orig_tensor_to)
-            def _safe_tensor_to(self, *a, **kw):
-                a = _cpu_args(a)
-                return _orig_tensor_to(self, *a, **kw)
-
-            torch.Tensor.to = _safe_tensor_to
-
-            _orig_module_to = torch.nn.Module.to
-
-            @functools.wraps(_orig_module_to)
-            def _safe_module_to(self, *a, **kw):
-                a = _cpu_args(a)
-                return _orig_module_to(self, *a, **kw)
-
-            torch.nn.Module.to = _safe_module_to
-
-        except Exception as e:
-            print(f"[force_cpu] patch warning: {e}")
-
-    def _cpu_args(args: tuple) -> tuple:
-        """
-        Redirect any cuda device argument to CPU.
-        Handles: str 'cuda', str 'cuda:0',
-                 torch.device('cuda'), torch.device('cuda:0')
-        """
-        if not args:
-            return args
-        import torch
-        arg = args[0]
-        if isinstance(arg, str) and "cuda" in arg:
-            return ("cpu",) + args[1:]
-        if isinstance(arg, torch.device) and arg.type == "cuda":
-            return (torch.device("cpu"),) + args[1:]
-        return args
+    @staticmethod
+    def _run(cmd, cwd):
+        result = subprocess.run(
+            cmd, cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace"
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"FOMM demo.py exited with code {result.returncode}.\n\n"
+                f"--- Output (last 3000 chars) ---\n{result.stdout[-3000:]}"
+            )
+        return result
 
     def animate(
         self,
-        source_image:  str,
+        source_image: str,
         driving_video: str,
-        output_path:   str,
-        config_path:   str = "config/vox-256.yaml",
-        checkpoint:    str = "vox-cpk.pth.tar",
-        relative:      bool = True,
-        adapt_scale:   bool = True,
+        output_path: str,
+        config_path: str = "config/vox-256.yaml",
+        checkpoint: str = "vox-cpk.pth.tar",
+        relative: bool = True,
+        adapt_scale: bool = True,
     ) -> str:
         self._validate()
-        self._setup_path()
-        self._force_cpu()
 
-        import importlib.util
+        # Resolve checkpoint to absolute path — relative paths break when
+        # demo.py is run with cwd=fomm_dir and the .tar is elsewhere
+        ckpt_abs = checkpoint if os.path.isabs(checkpoint) else \
+            str(Path(self.dir) / checkpoint)
+        if not os.path.isfile(ckpt_abs):
+            raise FileNotFoundError(
+                f"FOMM checkpoint not found: '{ckpt_abs}'\n"
+                f"Download vox-cpk.pth.tar from:\n"
+                f"  https://github.com/AliaksandrSiarohin/first-order-model/releases\n"
+                f"Then use the … button in the FOMM tab to point to it."
+            )
 
-        # Resolve checkpoint to absolute path
-        ckpt_abs = checkpoint if os.path.isabs(checkpoint) else str(Path(self.dir) / checkpoint)
-        out_abs  = str(Path(output_path).resolve())
+        # Resolve output path to absolute — demo.py may not respect relative paths
+        out_abs = str(Path(output_path).resolve())
 
-        sys.argv = [
-            "demo.py",
+        cmd = [
+            sys.executable, "demo.py",
             "--config",        config_path,
             "--checkpoint",    ckpt_abs,
             "--source_image",  source_image,
@@ -1163,16 +737,13 @@ class FOMMBackend:
             "--result_video",  out_abs,
         ]
         if relative:
-            sys.argv.append("--relative")
+            cmd.append("--relative")
         if adapt_scale:
-            sys.argv.append("--adapt_scale")
+            cmd.append("--adapt_scale")
 
-        spec   = importlib.util.spec_from_file_location(
-            "__main__", os.path.join(self.dir, "demo.py")
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        self._run(cmd, self.dir)
         return out_abs
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  PROCESSING WORKER (QThread)
@@ -1199,9 +770,9 @@ class ProcessingWorker(QThread):
             alg = self.config.get("algorithm", "insightface")
             dispatch = {
                 "insightface": self._run_insightface,
-                "simswap": self._run_simswap,
-                "sadtalker": self._run_sadtalker,
-                "fomm": self._run_fomm,
+                "simswap":     self._run_simswap,
+                "sadtalker":   self._run_sadtalker,
+                "fomm":        self._run_fomm,
             }
             fn = dispatch.get(alg)
             if fn:
@@ -1209,13 +780,7 @@ class ProcessingWorker(QThread):
             else:
                 self.error.emit(f"Unknown algorithm: {alg}")
         except Exception as exc:
-            import traceback
-            # Always show type + message + last 10 lines of traceback
-            tb = traceback.format_exc()
-            lines = tb.strip().splitlines()
-            tail = "\n".join(lines[-10:])
-            msg = str(exc) or f"({type(exc).__name__} with no message)"
-            self.error.emit(f"{msg}\n\n--- Traceback ---\n{tail}")
+            self.error.emit(str(exc))
 
     # ── InsightFace ───────────────────────────────────────────────
 
@@ -1290,57 +855,20 @@ class ProcessingWorker(QThread):
 
     def _run_simswap(self):
         cfg = self.config
-        self.log_msg.emit("Starting SimSwap (in-process)…", "info")
+        self.log_msg.emit("Starting SimSwap pipeline…", "info")
         backend = SimSwapBackend(cfg.get("simswap_dir", ""))
         src, tgt, out = cfg["source_path"], cfg["target_path"], cfg["output_path"]
 
-        # Resolve output to absolute BEFORE any chdir happens
-        out_abs = str(Path(out).resolve())
-
-        self.progress.emit(10)
         if Path(tgt).suffix.lower() in VIDEO_EXTS:
-            self.log_msg.emit("SimSwap: video mode (CPU)…", "info")
-            self.progress.emit(20)
-            result = backend.swap_video(
-                src, tgt, out_abs,
-                cfg.get("crop_size", 224),
-                cfg.get("use_mask", True)
-            )
+            self.log_msg.emit("SimSwap: video mode…", "info")
+            backend.swap_video(src, tgt, out, cfg.get("crop_size", 224), cfg.get("use_mask", True))
         else:
-            self.log_msg.emit("SimSwap: image mode (CPU)…", "info")
-            self.progress.emit(20)
-            result = backend.swap_image(
-                src, tgt, out_abs,
-                cfg.get("crop_size", 224),
-                cfg.get("use_mask", True)
-            )
-
-        # Use the absolute path returned by swap_video/swap_image
-        # Fall back to searching output dir if result path not found
-        if not Path(result).exists():
-            out_dir = Path(out_abs).parent
-            candidates = sorted(
-                list(out_dir.glob("*.mp4")) +
-                list(out_dir.glob("*.avi")) +
-                list(out_dir.glob("*.png")) +
-                list(out_dir.glob("*.jpg")),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True
-            )
-            if candidates:
-                result = str(candidates[0])
-                self.log_msg.emit(f"Output located at: {result}", "info")
-            else:
-                raise RuntimeError(
-                    f"SimSwap completed but output not found.\n"
-                    f"Expected: {result}\n"
-                    f"Searched: {out_dir}\n\n"
-                    f"Check SimSwap's temp_path for partial output."
-                )
+            self.log_msg.emit("SimSwap: image mode…", "info")
+            backend.swap_image(src, tgt, out, cfg.get("crop_size", 224), cfg.get("use_mask", True))
 
         self.progress.emit(100)
-        self.log_msg.emit(f"SimSwap complete → {result}", "success")
-        self.finished.emit(result)
+        self.log_msg.emit(f"SimSwap complete → {out}", "success")
+        self.finished.emit(out)
 
     # ── SadTalker ─────────────────────────────────────────────────
 
@@ -1356,7 +884,7 @@ class ProcessingWorker(QThread):
             size         = cfg.get("size", 256),
             preprocess   = cfg.get("preprocess", "crop"),
             still        = cfg.get("still_mode", False),
-            enhancer     = cfg.get("enhancer", "gfpgan"),
+            enhancer     =  _safe_enhancer(cfg.get("enhancer", "none")),
         )
         self.progress.emit(100)
         self.log_msg.emit(f"SadTalker complete → {result}", "success")
@@ -1366,17 +894,16 @@ class ProcessingWorker(QThread):
 
     def _run_fomm(self):
         cfg = self.config
-        self.log_msg.emit("Starting FOMM (in-process)…", "info")
+        self.log_msg.emit("Starting FOMM pipeline…", "info")
         backend = FOMMBackend(cfg.get("fomm_dir", ""))
-        self.progress.emit(10)
-        result = backend.animate(
-            source_image=cfg["source_path"],
-            driving_video=cfg["target_path"],
-            output_path=cfg["output_path"],
-            config_path=cfg.get("fomm_config", "config/vox-256.yaml"),
-            checkpoint=cfg.get("fomm_checkpoint", "vox-cpk.pth.tar"),
-            relative=cfg.get("relative", True),
-            adapt_scale=cfg.get("adapt_scale", True),
+        result  = backend.animate(
+            source_image  = cfg["source_path"],
+            driving_video = cfg["target_path"],
+            output_path   = cfg["output_path"],
+            config_path   = cfg.get("fomm_config", "config/vox-256.yaml"),
+            checkpoint    = cfg.get("fomm_checkpoint", "vox-cpk.pth.tar"),
+            relative      = cfg.get("relative", True),
+            adapt_scale   = cfg.get("adapt_scale", True),
         )
         self.progress.emit(100)
         self.log_msg.emit(f"FOMM complete → {result}", "success")
@@ -1714,7 +1241,7 @@ class SadTalkerParams(QWidget):
         self.preprocess    = QComboBox()
         self.preprocess.addItems(["crop", "resize", "full", "extcrop", "extfull"])
         self.enhancer      = QComboBox()
-        self.enhancer.addItems(["gfpgan", "RestoreFormer", "none"])
+        self.enhancer.addItems(["none","gfpgan", "RestoreFormer" ])
         self.still_mode    = QCheckBox("Still Mode  (minimize head motion)")
 
         hint = QLabel("Import a drive audio in the Media Import panel above.")
@@ -2436,11 +1963,6 @@ class DependencyCheckerDialog(QDialog):
 class DeepFakeStudio(QMainWindow):
     def __init__(self):
         super().__init__()
-        try:
-            import torch
-            torch.zeros(1)
-        except Exception:
-            pass
         self.setWindowTitle(f"{APP_NAME} v{VERSION}  ·  Forensic Testing")
         self.setMinimumSize(1120, 860)
         self._worker:   Optional[ProcessingWorker] = None
@@ -2464,8 +1986,14 @@ class DeepFakeStudio(QMainWindow):
         root.setContentsMargins(14, 10, 14, 10)
         root.setSpacing(10)
 
-        # Header bar
-        hdr_row = QHBoxLayout()
+        # Header bar — fixed height container prevents vertical stretch
+        hdr_widget = QWidget()
+        hdr_widget.setFixedHeight(40)  # ← locks height
+        hdr_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        hdr_row = QHBoxLayout(hdr_widget)
+        hdr_row.setContentsMargins(0, 0, 0, 0)
+        hdr_row.setSpacing(8)
+
         hdr = QLabel(f"🎭  {APP_NAME}  —  Forensic Deepfake Research Platform")
         hdr.setObjectName("header")
         hdr.setStyleSheet(f"font-size: 17px; font-weight: bold; color: {ACCENT2};")
@@ -2477,7 +2005,8 @@ class DeepFakeStudio(QMainWindow):
         hdr_row.addWidget(hdr)
         hdr_row.addStretch()
         hdr_row.addWidget(badge)
-        root.addLayout(hdr_row)
+
+        root.addWidget(hdr_widget)
 
         # Top splitter: Import | Algorithm
         top_split = QSplitter(Qt.Horizontal)
@@ -2492,16 +2021,18 @@ class DeepFakeStudio(QMainWindow):
         self.preview_panel = PreviewPanel()
         root.addWidget(self.preview_panel)
 
-        # Export + Log — side by side in one row
+        # Bottom row — Export + Log side by side
         bottom_split = QSplitter(Qt.Horizontal)
         bottom_split.setChildrenCollapsible(False)
+
         self.export_panel = ExportPanel()
         self.log_panel    = LogPanel()
+
         bottom_split.addWidget(self.export_panel)
         bottom_split.addWidget(self.log_panel)
         bottom_split.setSizes([480, 560])
-        root.addWidget(bottom_split)
 
+        root.addWidget(bottom_split)
 
     def _build_toolbar(self):
         tb = self.addToolBar("Main Toolbar")
@@ -2714,9 +2245,8 @@ class DeepFakeStudio(QMainWindow):
 
     def _pre_check_deps(self, algorithm: str) -> bool:
         """
-        Uses importlib.metadata to check installed packages on disk
-        WITHOUT importing them — avoids false negatives from broken
-        internal import chains (e.g. albumentations version conflicts).
+        Check deps using importlib.metadata ONLY — zero imports.
+        Avoids WinError 1114 from torch DLL loading after Qt init.
         """
         import importlib.metadata
 
@@ -2727,17 +2257,19 @@ class DeepFakeStudio(QMainWindow):
                 ("onnxruntime", "onnxruntime", "pip install onnxruntime"),
             ],
             "simswap": [
-                ("torch", "torch", "pip install torch torchvision"),
-                ("torchvision", "torchvision", "pip install torch torchvision"),
+                ("torch", "torch", "pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu"),
+                ("torchvision", "torchvision",
+                 "pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu"),
                 ("moviepy", "moviepy", 'pip install "moviepy==1.0.3"'),
             ],
             "sadtalker": [
                 ("torch", "torch", "pip install torch"),
+                ("safetensors", "safetensors", "pip install safetensors"),
                 ("face-alignment", "face_alignment", "pip install face-alignment"),
             ],
             "fomm": [
                 ("torch", "torch", "pip install torch"),
-                ("face-alignment", "face_alignment", "pip install face-alignment"),
+                ("torchvision", "torchvision", "pip install torchvision"),
             ],
         }
 
@@ -2759,7 +2291,6 @@ class DeepFakeStudio(QMainWindow):
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
-
         return reply == QMessageBox.Yes
 
     def _open_settings(self):
